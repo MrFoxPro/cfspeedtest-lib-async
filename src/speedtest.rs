@@ -1,12 +1,6 @@
-use crate::measurements::format_bytes;
-use crate::measurements::log_measurements;
-use crate::measurements::Measurement;
-use crate::progress::print_progress;
-use crate::OutputFormat;
-use crate::SpeedTestCLIOptions;
-use log;
-use regex::Regex;
-use reqwest::{blocking::Client, StatusCode};
+use super::{Measurement, format_bytes};
+
+use reqwest::Client;
 use serde::Serialize;
 use std::{
     fmt::Display,
@@ -51,7 +45,6 @@ impl PayloadSize {
     }
 
     pub fn sizes_from_max(max_payload_size: PayloadSize) -> Vec<usize> {
-        log::debug!("getting payload iterations for max_payload_size {max_payload_size:?}");
         let payload_bytes: Vec<usize> =
             vec![100_000, 1_000_000, 10_000_000, 25_000_000, 100_000_000];
         match max_payload_size {
@@ -82,88 +75,33 @@ impl Display for Metadata {
     }
 }
 
-pub fn speed_test(client: Client, options: SpeedTestCLIOptions) -> Vec<Measurement> {
-    let metadata = fetch_metadata(&client);
-    if options.output_format == OutputFormat::StdOut {
-        println!("{metadata}");
-    }
-    run_latency_test(&client, options.nr_latency_tests, options.output_format);
-    let payload_sizes = PayloadSize::sizes_from_max(options.max_payload_size);
-    let mut measurements = run_tests(
-        &client,
-        test_download,
-        TestType::Download,
-        payload_sizes.clone(),
-        options.nr_tests,
-        options.output_format,
-        options.disable_dynamic_max_payload_size,
-    );
-    measurements.extend(run_tests(
-        &client,
-        test_upload,
-        TestType::Upload,
-        payload_sizes.clone(),
-        options.nr_tests,
-        options.output_format,
-        options.disable_dynamic_max_payload_size,
-    ));
-    log_measurements(
-        &measurements,
-        payload_sizes,
-        options.verbose,
-        options.output_format,
-    );
-    measurements
-}
-
-pub fn run_latency_test(
+pub async fn run_latency_test(
     client: &Client,
     nr_latency_tests: u32,
-    output_format: OutputFormat,
 ) -> (Vec<f64>, f64) {
     let mut measurements: Vec<f64> = Vec::new();
     for i in 0..=nr_latency_tests {
-        if output_format == OutputFormat::StdOut {
-            print_progress("latency test", i, nr_latency_tests);
-        }
-        let latency = test_latency(client);
+        let latency = test_latency(client).await;
         measurements.push(latency);
     }
     let avg_latency = measurements.iter().sum::<f64>() / measurements.len() as f64;
-
-    if output_format == OutputFormat::StdOut {
-        println!(
-            "\nAvg GET request latency {avg_latency:.2} ms (RTT excluding server processing time)\n"
-        );
-    }
     (measurements, avg_latency)
 }
 
-pub fn test_latency(client: &Client) -> f64 {
+pub async fn test_latency(client: &Client) -> f64 {
     let url = &format!("{}/{}{}", BASE_URL, DOWNLOAD_URL, 0);
     let req_builder = client.get(url);
 
     let start = Instant::now();
-    let response = req_builder.send().expect("failed to get response");
-    let _status_code = response.status();
+    let response = req_builder.send().await.expect("failed to get response");
     let duration = start.elapsed().as_secs_f64() * 1_000.0;
 
-    let re = Regex::new(r"cfRequestDuration;dur=([\d.]+)").unwrap();
-    let cf_req_duration: f64 = re
-        .captures(
-            response
-                .headers()
-                .get("Server-Timing")
-                .expect("No Server-Timing in response header")
-                .to_str()
-                .unwrap(),
-        )
-        .unwrap()
-        .get(1)
-        .unwrap()
-        .as_str()
-        .parse()
-        .unwrap();
+    let server_timing = response.headers().get("Server-Timing")
+        .expect("No Server-Timing in response header")
+        .to_str().unwrap();
+
+    let cf_req_duration: f64 = server_timing.split(';').find_map(|part| part.trim_start_matches("dur=").parse().ok()).unwrap_or(0.0);
+
     let mut req_latency = duration - cf_req_duration;
     if req_latency < 0.0 {
         // TODO investigate negative latency values
@@ -176,114 +114,67 @@ const TIME_THRESHOLD: Duration = Duration::from_secs(5);
 
 pub fn run_tests(
     client: &Client,
-    test_fn: fn(&Client, usize, OutputFormat) -> f64,
+    test_fn: fn(&Client, usize) -> f64,
     test_type: TestType,
     payload_sizes: Vec<usize>,
     nr_tests: u32,
-    output_format: OutputFormat,
     disable_dynamic_max_payload_size: bool,
 ) -> Vec<Measurement> {
     let mut measurements: Vec<Measurement> = Vec::new();
     for payload_size in payload_sizes {
-        log::debug!("running tests for payload_size {payload_size}");
         let start = Instant::now();
         for i in 0..nr_tests {
-            if output_format == OutputFormat::StdOut {
-                print_progress(
-                    &format!("{:?} {:<5}", test_type, format_bytes(payload_size)),
-                    i,
-                    nr_tests,
-                );
-            }
-            let mbit = test_fn(client, payload_size, output_format);
+            let mbit = test_fn(client, payload_size);
             measurements.push(Measurement {
                 test_type,
                 payload_size,
                 mbit,
             });
         }
-        if output_format == OutputFormat::StdOut {
-            print_progress(
-                &format!("{:?} {:<5}", test_type, format_bytes(payload_size)),
-                nr_tests,
-                nr_tests,
-            );
-            println!()
-        }
+
         let duration = start.elapsed();
 
         // only check TIME_THRESHOLD if dynamic max payload sizing is not disabled
         if !disable_dynamic_max_payload_size && duration > TIME_THRESHOLD {
-            log::info!("Exceeded threshold");
             break;
         }
     }
     measurements
 }
 
-pub fn test_upload(client: &Client, payload_size_bytes: usize, output_format: OutputFormat) -> f64 {
+pub async fn test_upload(client: &Client, payload_size_bytes: usize) -> f64 {
     let url = &format!("{BASE_URL}/{UPLOAD_URL}");
     let payload: Vec<u8> = vec![1; payload_size_bytes];
     let req_builder = client.post(url).body(payload);
-    let (status_code, mbits, duration) = {
-        let start = Instant::now();
-        let response = req_builder.send().expect("failed to get response");
-        let status_code = response.status();
-        let duration = start.elapsed();
-        let mbits = (payload_size_bytes as f64 * 8.0 / 1_000_000.0) / duration.as_secs_f64();
-        (status_code, mbits, duration)
-    };
-    if output_format == OutputFormat::StdOut {
-        print_current_speed(mbits, duration, status_code, payload_size_bytes);
-    }
+
+	let start = Instant::now();
+	let _ = req_builder.send().await.expect("failed to get response");
+	let duration = start.elapsed();
+
+	let mbits = (payload_size_bytes as f64 * 8.0 / 1_000_000.0) / duration.as_secs_f64();
     mbits
 }
 
-pub fn test_download(
-    client: &Client,
-    payload_size_bytes: usize,
-    output_format: OutputFormat,
-) -> f64 {
+pub async fn test_download(client: &Client, payload_size_bytes: usize) -> f64 {
     let url = &format!("{BASE_URL}/{DOWNLOAD_URL}{payload_size_bytes}");
     let req_builder = client.get(url);
-    let (status_code, mbits, duration) = {
-        let response = req_builder.send().expect("failed to get response");
-        let status_code = response.status();
-        let start = Instant::now();
-        let _res_bytes = response.bytes();
-        let duration = start.elapsed();
-        let mbits = (payload_size_bytes as f64 * 8.0 / 1_000_000.0) / duration.as_secs_f64();
-        (status_code, mbits, duration)
-    };
-    if output_format == OutputFormat::StdOut {
-        print_current_speed(mbits, duration, status_code, payload_size_bytes);
-    }
+
+	let start = Instant::now();
+	let _ = req_builder.send().await.expect("failed to get response");
+	let duration = start.elapsed();
+
+	let mbits = (payload_size_bytes as f64 * 8.0 / 1_000_000.0) / duration.as_secs_f64();
+
     mbits
 }
 
-fn print_current_speed(
-    mbits: f64,
-    duration: Duration,
-    status_code: StatusCode,
-    payload_size_bytes: usize,
-) {
-    print!(
-        "  {:>6.2} mbit/s | {:>5} in {:>4}ms -> status: {}  ",
-        mbits,
-        format_bytes(payload_size_bytes),
-        duration.as_millis(),
-        status_code
-    );
-}
-
-pub fn fetch_metadata(client: &Client) -> Metadata {
+pub async fn fetch_metadata(client: &Client) -> Metadata {
     let url = &format!("{}/{}{}", BASE_URL, DOWNLOAD_URL, 0);
-    let headers = client
-        .get(url)
-        .send()
+    let headers = client.get(url).send().await
         .expect("failed to get response")
         .headers()
         .to_owned();
+	
     Metadata {
         city: extract_header_value(&headers, "cf-meta-city", "City N/A"),
         country: extract_header_value(&headers, "cf-meta-country", "Country N/A"),
@@ -293,14 +184,6 @@ pub fn fetch_metadata(client: &Client) -> Metadata {
     }
 }
 
-fn extract_header_value(
-    headers: &reqwest::header::HeaderMap,
-    header_name: &str,
-    na_value: &str,
-) -> String {
-    headers
-        .get(header_name)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or(na_value)
-        .to_owned()
+fn extract_header_value(headers: &reqwest::header::HeaderMap, header_name: &str, na_value: &str) -> String {
+    headers.get(header_name).and_then(|value| value.to_str().ok()).unwrap_or(na_value).to_owned()
 }
